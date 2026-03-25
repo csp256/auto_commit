@@ -1,0 +1,23 @@
+{
+  "schedule": {
+    "mode": "debug",
+    "every_minutes": 10,
+    "start_hour": 8,
+    "start_minute": 0,
+    "end_hour": 18,
+    "end_minute": 0
+  },
+  "jobs": [
+    {
+      "name": "work",
+      "source": "C:\\work",
+      "git_dir": "C:\\Users\\USERNAME\\AppData\\Local\\auto_commit\\git\\work",
+      "repo_url": "git@gitlab.example.com:USERNAME/work.git",
+      "branch": "main",
+      "git_author_name": "auto_commit",
+      "git_author_email": "auto_commit@localhost",
+      "heartbeat_always_commit": true,
+      "missing_source_fatal": false
+    }
+  ]
+}

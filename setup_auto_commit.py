@@ -181,7 +181,7 @@ def write_windows_runner(project_dir: Path, config_path: Path) -> Path:
             $env:Path = "$uvDir;$env:Path"
         }}
 
-        uv run "{project_dir / "auto_commit.py"}" --config "{config_path}"
+        uv run "{project_dir / "auto_commit.py"}" --config "{config_path} --automatic"
         exit $LASTEXITCODE
         """
     )
@@ -291,13 +291,12 @@ def write_launch_agent(auto_commit_script: Path, config_path: Path, schedule: di
 
             <key>ProgramArguments</key>
             <array>
-              <string>{uv_path}</string>
-              <string>run</string>
-              <string>--python</string>
-              <string>3.12</string>
-              <string>{auto_commit_script}</string>
-              <string>--config</string>
-              <string>{config_path}</string>
+            <string>{uv_path}</string>
+            <string>run</string>
+            <string>{auto_commit_script}</string>
+            <string>--config</string>
+            <string>{config_path}</string>
+            <string>--automatic</string>
             </array>
 
             <key>WorkingDirectory</key>

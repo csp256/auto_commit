@@ -275,6 +275,28 @@ def has_staged_changes(job: Job) -> bool:
     return cp.returncode == 1
 
 
+def staged_shortstat(job: Job, log_path: Path) -> str:
+    cp = git(
+        job,
+        "diff",
+        "--cached",
+        "--shortstat",
+        "--",
+        ".",
+        f":(exclude){HEARTBEAT_DIRNAME}/{HEARTBEAT_FILENAME}",
+    )
+    append_log(log_path, f"git diff --cached --shortstat rc={cp.returncode}")
+    if cp.stdout.strip():
+        append_log(log_path, f"git diff --cached --shortstat stdout:\n{cp.stdout}")
+    if cp.stderr.strip():
+        append_log(log_path, f"git diff --cached --shortstat stderr:\n{cp.stderr}")
+
+    if cp.returncode != 0:
+        return ""
+
+    return cp.stdout.strip()
+
+
 def commit(job: Job, message: str, log_path: Path) -> tuple[bool, str | None]:
     env = git_env(job)
     env["GIT_AUTHOR_NAME"] = job.git_author_name
@@ -329,12 +351,44 @@ def push(job: Job, log_path: Path) -> bool:
     return cp2.returncode == 0
 
 
-def make_commit_message(job: Job) -> str:
-    host = socket.gethostname()
-    return f"auto_commit(job={job.name},host={host},ts={iso_now()})"
+# def staged_line_stats(job: Job, log_path: Path) -> tuple[int, int]:
+#     cp = git(job, "diff", "--cached", "--numstat")
+#     append_log(log_path, f"git diff --cached --numstat rc={cp.returncode}")
+#     if cp.stdout.strip():
+#         append_log(log_path, f"git diff --cached --numstat stdout:\n{cp.stdout}")
+#     if cp.stderr.strip():
+#         append_log(log_path, f"git diff --cached --numstat stderr:\n{cp.stderr}")
+
+#     if cp.returncode != 0:
+#         return 0, 0
+
+#     added_total = 0
+#     deleted_total = 0
+
+#     for line in cp.stdout.splitlines():
+#         parts = line.split("\t", 2)
+#         if len(parts) < 2:
+#             continue
+
+#         added_str, deleted_str = parts[0], parts[1]
+
+#         # Binary files show "-" instead of a numeric count.
+#         if added_str.isdigit():
+#             added_total += int(added_str)
+#         if deleted_str.isdigit():
+#             deleted_total += int(deleted_str)
+
+#     return added_total, deleted_total
 
 
-def process_job(job: Job) -> JobResult:
+def make_commit_message(*, automatic: bool, shortstat: str) -> str:
+    kind = "auto" if automatic else "manual"
+    if shortstat:
+        return f"{kind}: {shortstat}"
+    return f"{kind}: no change"
+
+
+def process_job(job: Job, *, automatic: bool) -> JobResult:
     log_path = job.git_dir / LOG_FILENAME
     lock_path = job.git_dir / LOCK_FILENAME
     warnings: list[str] = []
@@ -394,7 +448,13 @@ def process_job(job: Job) -> JobResult:
                 errors=errors,
             )
 
-        committed, sha = commit(job, make_commit_message(job), log_path)
+        shortstat = staged_shortstat(job, log_path)
+
+        committed, sha = commit(
+            job,
+            make_commit_message(automatic=automatic, shortstat=shortstat),
+            log_path,
+        )
         if not committed:
             msg = "Commit failed"
             append_log(log_path, msg)
@@ -484,10 +544,15 @@ def main() -> int:
         type=Path,
         default=Path(__file__).resolve().with_name("config.json"),
     )
+    parser.add_argument(
+        "--automatic",
+        action="store_true",
+        help="Mark this run as an automatic scheduled backup.",
+    )
     args = parser.parse_args()
 
     jobs = load_jobs(args.config)
-    results = [process_job(job) for job in jobs]
+    results = [process_job(job, automatic=args.automatic) for job in jobs]
     return print_summary(results)
 
 

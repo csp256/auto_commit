@@ -77,7 +77,7 @@ def default_config() -> dict:
                 "git_author_name": "auto_commit",
                 "git_author_email": "auto_commit@localhost",
                 "heartbeat_always_commit": True,
-                "missing_source_fatal": False,
+                "missing_source_fatal": False
             }
         ]
     }
@@ -85,7 +85,8 @@ def default_config() -> dict:
 
 def write_default_config(config_path: Path) -> None:
     ensure_dir(config_path.parent)
-    config_path.write_text(json.dumps(default_config(), indent=2) + "\n", encoding="utf-8")
+    if not config_path.exists():
+        config_path.write_text(json.dumps(default_config(), indent=2) + "\n", encoding="utf-8")
 
 
 def git_env(git_dir: Path, work_tree: Path) -> dict[str, str]:
@@ -102,6 +103,7 @@ def git(git_dir: Path, work_tree: Path, *args: str, check: bool = False) -> subp
         capture_output=True,
         check=check,
         env=git_env(git_dir, work_tree),
+        cwd=str(work_tree),
     )
 
 
@@ -137,6 +139,8 @@ def ensure_repo(job: dict) -> None:
     if cp.returncode != 0:
         raise RuntimeError(f"git switch failed for {job['name']}:\n{cp.stderr}")
 
+    git(git_dir, source, "config", "lfs.locksverify", "false")
+
 
 def load_config(config_path: Path) -> dict:
     return json.loads(config_path.read_text(encoding="utf-8"))
@@ -152,10 +156,14 @@ def normalize_schedule(raw: dict) -> dict:
     if mode == "daily":
         hour = int(schedule.get("hour", DEFAULT_HOUR))
         minute = int(schedule.get("minute", DEFAULT_MINUTE))
+        if not (0 <= hour <= 23):
+            raise RuntimeError(f"Invalid daily hour: {hour}")
+        if not (0 <= minute <= 59):
+            raise RuntimeError(f"Invalid daily minute: {minute}")
         return {"mode": "daily", "hour": hour, "minute": minute}
 
-    every_minutes = int(schedule.get("every_minutes", 15))
-    if every_minutes <= 0:
+    every_minutes = int(schedule.get("every_minutes", 5))
+    if every_minutes <= 0 or every_minutes > 60:
         raise RuntimeError(f"Invalid debug every_minutes: {every_minutes}")
 
     return {"mode": "debug", "every_minutes": every_minutes}
@@ -173,7 +181,7 @@ def write_windows_runner(project_dir: Path, config_path: Path) -> Path:
             $env:Path = "$uvDir;$env:Path"
         }}
 
-        uv run --python 3.12 "{project_dir / "auto_commit.py"}" --config "{config_path}"
+        uv run "{project_dir / "auto_commit.py"}" --config "{config_path}"
         exit $LASTEXITCODE
         """
     )
@@ -232,6 +240,13 @@ def launch_agent_path() -> Path:
     return Path.home() / "Library" / "LaunchAgents" / f"{MACOS_LABEL}.plist"
 
 
+def make_start_calendar_array(every_minutes: int) -> str:
+    entries: list[str] = []
+    for minute in range(0, 60, every_minutes):
+        entries.append(f'      <dict><key>Minute</key><integer>{minute}</integer></dict>')
+    return "<array>\n" + "\n".join(entries) + "\n    </array>"
+
+
 def write_launch_agent(auto_commit_script: Path, config_path: Path, schedule: dict) -> Path:
     plist_path = launch_agent_path()
     stdout_log = logs_dir() / "auto_commit.out.log"
@@ -242,25 +257,25 @@ def write_launch_agent(auto_commit_script: Path, config_path: Path, schedule: di
     ensure_dir(stdout_log.parent)
 
     if schedule["mode"] == "daily":
+        # Use the same array style that worked in debug mode.
         schedule_block = textwrap.dedent(
             f"""\
             <key>StartCalendarInterval</key>
-            <dict>
-              <key>Hour</key>
-              <integer>{schedule["hour"]}</integer>
-              <key>Minute</key>
-              <integer>{schedule["minute"]}</integer>
-            </dict>
+            <array>
+              <dict>
+                <key>Hour</key>
+                <integer>{schedule["hour"]}</integer>
+                <key>Minute</key>
+                <integer>{schedule["minute"]}</integer>
+              </dict>
+            </array>
             """
         )
         run_at_load = "false"
     else:
-        seconds = int(schedule["every_minutes"]) * 60
-        schedule_block = textwrap.dedent(
-            f"""\
-            <key>StartInterval</key>
-            <integer>{seconds}</integer>
-            """
+        schedule_block = (
+            "<key>StartCalendarInterval</key>\n"
+            + make_start_calendar_array(schedule["every_minutes"])
         )
         run_at_load = "true"
 
@@ -285,13 +300,16 @@ def write_launch_agent(auto_commit_script: Path, config_path: Path, schedule: di
               <string>{config_path}</string>
             </array>
 
-            {schedule_block}
+            <key>WorkingDirectory</key>
+            <string>{app_root()}</string>
+
             <key>EnvironmentVariables</key>
             <dict>
               <key>PATH</key>
               <string>{Path.home()}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
             </dict>
 
+            {schedule_block}
             <key>StandardOutPath</key>
             <string>{stdout_log}</string>
 
@@ -305,31 +323,66 @@ def write_launch_agent(auto_commit_script: Path, config_path: Path, schedule: di
         """
     )
     plist_path.write_text(plist, encoding="utf-8")
+    plist_path.chmod(0o644)
     return plist_path
 
 
-def install_launch_agent(plist_path: Path) -> None:
-    run(["launchctl", "unload", str(plist_path)])
-    cp = run(["launchctl", "load", str(plist_path)])
+def lint_plist(plist_path: Path) -> None:
+    cp = run(["plutil", "-lint", str(plist_path)])
     if cp.returncode != 0:
-        raise RuntimeError(f"launchctl load failed:\nSTDOUT:\n{cp.stdout}\nSTDERR:\n{cp.stderr}")
+        raise RuntimeError(f"plutil lint failed:\nSTDOUT:\n{cp.stdout}\nSTDERR:\n{cp.stderr}")
 
+
+def install_launch_agent(plist_path: Path, schedule: dict) -> None:
+    uid = str(os.getuid())
+    service = f"gui/{uid}/{MACOS_LABEL}"
+    domain = f"gui/{uid}"
+
+    lint_plist(plist_path)
+
+    # Remove old loaded instance if present, but do not disable the service.
+    run(["launchctl", "bootout", service])
+    run(["launchctl", "bootout", domain, str(plist_path)])
+
+    # Make sure the service is runnable.
+    run(["launchctl", "enable", service])
+
+    cp = run(["launchctl", "bootstrap", domain, str(plist_path)])
+    if cp.returncode != 0:
+        raise RuntimeError(
+            f"launchctl bootstrap failed:\nSTDOUT:\n{cp.stdout}\nSTDERR:\n{cp.stderr}"
+        )
+
+    if schedule["mode"] == "debug":
+        cp = run(["launchctl", "kickstart", "-k", service])
+        if cp.returncode != 0:
+            raise RuntimeError(
+                f"launchctl kickstart failed:\nSTDOUT:\n{cp.stdout}\nSTDERR:\n{cp.stderr}"
+            )
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, default=config_default_path())
     parser.add_argument("--task-name", default=WINDOWS_TASK_NAME)
     parser.add_argument("--write-default-config", action="store_true")
+    parser.add_argument("--install", action="store_true")
     parser.add_argument("--project-dir", type=Path, default=Path(__file__).resolve().parent)
     args = parser.parse_args()
 
-    if args.write_default_config and not args.config.exists():
+    if args.write_default_config:
         write_default_config(args.config)
+        print(f"Wrote default config: {args.config}")
+        print("Edit the config, then:")
+        print("\tuv run ./setup_auto_commit.py --install")
+        return 0
+
+    if not args.install:
+        raise RuntimeError("Use --write-default-config or --install")
 
     if not args.config.exists():
         raise RuntimeError(
             f"Config does not exist: {args.config}\n"
-            "Run once with --write-default-config, then edit the config and rerun."
+            "Run once with --write-default-config first."
         )
 
     raw = load_config(args.config)
@@ -348,7 +401,7 @@ def main() -> int:
     elif sys.platform == "darwin":
         copied_script = copy_auto_commit_script(args.project_dir)
         plist = write_launch_agent(copied_script, args.config, schedule)
-        install_launch_agent(plist)
+        install_launch_agent(plist, schedule)
         print(f"Installed macOS LaunchAgent '{MACOS_LABEL}'")
         print(f"script: {copied_script}")
         print(f"plist: {plist}")

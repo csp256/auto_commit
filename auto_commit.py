@@ -163,12 +163,47 @@ def repo_exists(git_dir: Path) -> bool:
     return (git_dir / "HEAD").exists() and (git_dir / "objects").exists()
 
 
+def attach_to_remote_history(job: Job, log_path: Path) -> None:
+    fetch = git(job, "fetch", "origin", job.branch)
+    append_log(log_path, f"git fetch rc={fetch.returncode}")
+    if fetch.stdout.strip():
+        append_log(log_path, f"git fetch stdout:\n{fetch.stdout}")
+    if fetch.stderr.strip():
+        append_log(log_path, f"git fetch stderr:\n{fetch.stderr}")
+
+    if fetch.returncode != 0:
+        return
+
+    remote_ref = f"refs/remotes/origin/{job.branch}"
+    check = git(job, "show-ref", "--verify", remote_ref)
+    append_log(log_path, f"git show-ref rc={check.returncode}")
+    if check.stdout.strip():
+        append_log(log_path, f"git show-ref stdout:\n{check.stdout}")
+    if check.stderr.strip():
+        append_log(log_path, f"git show-ref stderr:\n{check.stderr}")
+
+    if check.returncode != 0:
+        return
+
+    git(job, "update-ref", f"refs/heads/{job.branch}", remote_ref, check=True)
+    git(job, "symbolic-ref", "HEAD", f"refs/heads/{job.branch}", check=True)
+
+    upstream = git(job, "branch", "--set-upstream-to", f"origin/{job.branch}", job.branch)
+    append_log(log_path, f"git branch --set-upstream-to rc={upstream.returncode}")
+    if upstream.stdout.strip():
+        append_log(log_path, f"git branch --set-upstream-to stdout:\n{upstream.stdout}")
+    if upstream.stderr.strip():
+        append_log(log_path, f"git branch --set-upstream-to stderr:\n{upstream.stderr}")
+
+
 def ensure_repo(job: Job, log_path: Path) -> None:
     ensure_dir(job.git_dir)
 
+    newly_initialized = False
     if not repo_exists(job.git_dir):
         append_log(log_path, f"Initializing git dir: {job.git_dir}")
         git(job, "init", "--initial-branch", job.branch, check=True)
+        newly_initialized = True
 
     remote = git(job, "remote", "get-url", "origin")
     if remote.returncode != 0:
@@ -178,9 +213,20 @@ def ensure_repo(job: Job, log_path: Path) -> None:
         if current != job.repo_url:
             git(job, "remote", "set-url", "origin", job.repo_url, check=True)
 
-    sw = git(job, "switch", "-C", job.branch)
-    if sw.returncode != 0:
-        raise RuntimeError(f"Failed to switch to branch {job.branch}: {sw.stderr.strip()}")
+    if newly_initialized:
+        attach_to_remote_history(job, log_path)
+
+    head = git(job, "symbolic-ref", "--quiet", "--short", "HEAD")
+    current_branch = head.stdout.strip() if head.returncode == 0 else ""
+
+    if current_branch != job.branch:
+        sw = git(job, "switch", job.branch)
+        if sw.returncode != 0:
+            sw = git(job, "switch", "-c", job.branch)
+            if sw.returncode != 0:
+                raise RuntimeError(f"Failed to switch to branch {job.branch}: {sw.stderr.strip()}")
+
+    git(job, "config", "lfs.locksverify", "false")
 
 
 def write_heartbeat(job: Job, warnings: list[str], errors: list[str]) -> Path:
@@ -257,7 +303,30 @@ def push(job: Job, log_path: Path) -> bool:
         append_log(log_path, f"git push stdout:\n{cp.stdout}")
     if cp.stderr.strip():
         append_log(log_path, f"git push stderr:\n{cp.stderr}")
-    return cp.returncode == 0
+
+    if cp.returncode == 0:
+        return True
+
+    stderr = cp.stderr.lower()
+    non_fast_forward = (
+        "non-fast-forward" in stderr
+        or "fetch first" in stderr
+        or "tip of your current branch is behind" in stderr
+    )
+
+    if not non_fast_forward:
+        return False
+
+    append_log(log_path, "Normal push rejected as non-fast-forward; retrying with --force-with-lease")
+
+    cp2 = git(job, "push", "--force-with-lease", "-u", "origin", job.branch)
+    append_log(log_path, f"git push --force-with-lease rc={cp2.returncode}")
+    if cp2.stdout.strip():
+        append_log(log_path, f"git push --force-with-lease stdout:\n{cp2.stdout}")
+    if cp2.stderr.strip():
+        append_log(log_path, f"git push --force-with-lease stderr:\n{cp2.stderr}")
+
+    return cp2.returncode == 0
 
 
 def make_commit_message(job: Job) -> str:
@@ -410,7 +479,11 @@ def print_summary(results: list[JobResult]) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", required=True, type=Path)
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path(__file__).resolve().with_name("config.json"),
+    )
     args = parser.parse_args()
 
     jobs = load_jobs(args.config)
